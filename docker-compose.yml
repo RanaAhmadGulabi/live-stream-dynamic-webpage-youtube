@@ -1,11 +1,22 @@
-# remove or ignore the top-level version: line to silence that warning
 services:
   stream:
     build: .
+    env_file: .env
     restart: always
-    env_file:
-      - .env
     volumes:
       - ./html:/app/html:ro
       - ./screenshots:/app/screenshots
       - ./start.sh:/app/start.sh:ro
+    ports:               # expose health only, nothing else public
+      - "8890:8890"
+    healthcheck:
+      test: ["CMD", "curl", "-fs", "http://localhost:8890/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3  
+    # Optional resource caps
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 1G
