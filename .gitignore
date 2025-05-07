@@ -1,0 +1,20 @@
+# Ignore the screenshots folder
+screenshots/
+
+# Ignore .env but allow .env.example
+.env
+
+# Docker and system files
+__pycache__/
+*.pyc
+*.log
+*.sqlite3
+*.pid
+
+# VSCode and editor settings
+.vscode/
+.idea/
+
+# Node/npm (if applicable)
+node_modules/
+dist/
