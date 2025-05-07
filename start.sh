@@ -1,95 +1,119 @@
-#!/bin/bash
-set -e
+#!/usr/bin/env bash
+set -euo pipefail
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 0) Disable Chrome "make default browser" prompt via enterprise policy
+# ─── 0) Required ENV ───────────────────────────────────────────────────────────
+: "${RESOLUTION:?Need RESOLUTION (e.g. 1280x720)}"
+: "${FPS:=30}"
+: "${STREAM_URL:?Need STREAM_URL (rtmps://…)}"
+: "${STREAM_KEY:?Need STREAM_KEY}"
+: "${TARGET_URL:?Need TARGET_URL (http://localhost:8080/chart.html)}"
+: "${BITRATE:=2500k}"
+: "${BUF_SIZE:=512k}"
+
+# ─── 1) Cleanup ────────────────────────────────────────────────────────────────
+pkill Xvfb        >/dev/null 2>&1 || true
+rm -rf /tmp/.X99-lock /tmp/chrome-profile /tmp/runtime-root
+
+# ─── 2) DBus setup ─────────────────────────────────────────────────────────────
+mkdir -p /run/dbus
+dbus-daemon --system --fork --print-address
+if command -v dbus-launch >/dev/null; then
+    eval "$(dbus-launch --sh-syntax --exit-with-session)"
+    export DBUS_SESSION_BUS_ADDRESS
+fi
+
+# ─── 3) Disable Chrome "Default browser" prompt ────────────────────────────────
 mkdir -p /etc/opt/chrome/policies/managed
-cat <<'EOF' >/etc/opt/chrome/policies/managed/disable_default_browser_prompt.json
-{
-  "DefaultBrowserPromptEnabled": false
-}
+cat >/etc/opt/chrome/policies/managed/disable_default_browser_prompt.json <<EOF
+{ "DefaultBrowserPromptEnabled": false }
 EOF
 
-# 0.1) Cleanup any stale Xvfb
-pkill Xvfb           || true
-rm -f /tmp/.X99-lock
-
-# 0.2) Prepare XDG_RUNTIME_DIR (needed by Chrome)
+# ─── 4) Parse dimensions & prepare X ───────────────────────────────────────────
 export XDG_RUNTIME_DIR=/tmp/runtime-root
-mkdir -p "$XDG_RUNTIME_DIR"
-chmod 700 "$XDG_RUNTIME_DIR"
-# ─────────────────────────────────────────────────────────────────────────────
+mkdir -p "$XDG_RUNTIME_DIR" && chmod 700 "$XDG_RUNTIME_DIR"
 
-# 1) Parse RESOLUTION into WIDTH and HEIGHT (expects "1280x720")
 WIDTH="${RESOLUTION%x*}"
 HEIGHT="${RESOLUTION#*x}"
 
-# 2) Start virtual X display
+# ─── 5) Launch virtual display + WM ────────────────────────────────────────────
 Xvfb :99 -screen 0 "${WIDTH}x${HEIGHT}x24" &
 export DISPLAY=:99
+fluxbox -display :99 >/dev/null 2>&1 &
 
-# 3) Launch a D-Bus session for Chrome
-eval "$(dbus-launch --sh-syntax --exit-with-session)"
-export DBUS_SYSTEM_BUS_ADDRESS="$DBUS_SESSION_BUS_ADDRESS"
+# Wait for display to be ready
+for i in {1..20}; do
+  xdpyinfo -display "$DISPLAY" >/dev/null 2>&1 && break
+  sleep 0.2
+done
 
-# 4) Serve your chart.html on localhost:8080
-( cd /app/html && python3 -m http.server 8080 ) &
-# ─── start.sh excerpt ────────────────────────────────────────────────────────
+# ─── 6) Serve static chart.html ────────────────────────────────────────────────
+(
+  cd /app/html
+  exec python3 -u -m http.server 8080
+) &
 
-# 3) Prepare an empty profile dir so Chrome won't fall back to your system defaults:
+# ─── 7) Launch Chrome ──────────────────────────────────────────────────────────
 export CHROME_USER_DATA=/tmp/chrome-profile
-rm -rf "${CHROME_USER_DATA}"
-mkdir -p "${CHROME_USER_DATA}"
+rm -rf "$CHROME_USER_DATA"
+mkdir -p "$CHROME_USER_DATA"
 
-# 4) Launch Chrome “app”/kiosk mode using that clean profile and disable every
-#    default-browser check/promt feature:
 google-chrome-stable \
-  --user-data-dir="${CHROME_USER_DATA}" \
-  --no-first-run \
-  --no-default-browser-check \
-  --disable-default-apps \
-  --disable-infobars \
-  --disable-features=DefaultBrowserUI,DefaultBrowserPromo \
-  --kiosk \
-  --window-size=${WIDTH},${HEIGHT} \
-  "${TARGET_URL}" &
-  
+  --no-sandbox --disable-setuid-sandbox \
+  --disable-dev-shm-usage \
+  --user-data-dir="$CHROME_USER_DATA" \
+  --app="$TARGET_URL" \
+  --kiosk --start-fullscreen \
+  --window-size="${WIDTH},${HEIGHT}" \
+  --disable-gpu --enable-software-rasterizer \
+  --use-gl=swiftshader \
+  --incognito --disable-infobars \
+  --disable-features=TranslateUI,DefaultBrowserUI \
+  --disable-extensions --no-first-run \
+  > /tmp/chrome.log 2>&1 &
 
-# Give Chrome & TradingView a moment to fully render
-sleep 15
+# ─── 8) Wait for chart page to load ────────────────────────────────────────────
+echo "→ waiting for ${TARGET_URL} …"
+until curl -fs --max-time 2 "$TARGET_URL" >/dev/null; do
+  sleep 1
+done
 
-# 6) Background screenshot loop (for debugging) every 10s
+# ─── 9) Probe screen (render check) ────────────────────────────────────────────
+echo "→ probing first rendered frame…"
+mkdir -p /tmp
+for i in {1..30}; do
+  ffmpeg -y -loglevel error \
+    -f x11grab -video_size "${WIDTH}x${HEIGHT}" -i "${DISPLAY}" \
+    -frames:v 1 /tmp/render_check.png
+
+  if [ "$(stat -c%s /tmp/render_check.png)" -gt 20000 ]; then
+    echo "→ chart painted!"
+    break
+  fi
+  sleep 1
+done
+
+# ─── 10) Screenshot loop for debugging ─────────────────────────────────────────
 mkdir -p /app/screenshots
-while true; do
-  google-chrome-stable \
-    --no-sandbox \
-    --headless \
-    --no-default-browser-check \
-    --disable-first-run-ui \
-    --disable-default-apps \
-    --disable-infobars \
-    --disable-features=DefaultBrowserUI \
-    --enable-webgl \
-    --use-gl=swiftshader \
-    --enable-unsafe-swiftshader \
-    --disable-dev-shm-usage \
-    --ignore-certificate-errors \
-    --virtual-time-budget=10000 \
-    --window-size=${WIDTH},${HEIGHT} \
-    --screenshot="/app/screenshots/$(date +%Y%m%d_%H%M%S).png" \
-    "${TARGET_URL}"
-  sleep 10
-done &
+(
+  while true; do
+    shot="/app/screenshots/$(date +%Y%m%d_%H%M%S).png"
+    ffmpeg -y -loglevel error \
+      -f x11grab -video_size "${WIDTH}x${HEIGHT}" -i "${DISPLAY}" \
+      -frames:v 1 "$shot" && echo "📸 $shot"
+    sleep 10
+  done
+) &
 
-# 7) Capture & push to YouTube Live at ${FPS}fps with silent audio
-echo "→ Streaming to: ${STREAM_URL}/${STREAM_KEY}"
-ffmpeg \
-  -f x11grab \
-    -probesize 50M -analyzeduration 100M -thread_queue_size 512 \
-    -framerate "${FPS}" -video_size "${WIDTH}x${HEIGHT}" -i :99.0 \
+# ─── 11) Start stream ──────────────────────────────────────────────────────────
+echo "→ Starting live stream to: ${STREAM_URL}/${STREAM_KEY}"
+exec ffmpeg \
+  -thread_queue_size 512 \
+  -probesize 10M -analyzeduration 10M \
+  -f x11grab -framerate "${FPS}" \
+      -video_size "${WIDTH}x${HEIGHT}" -i "${DISPLAY}" \
   -f lavfi -i anullsrc=channel_layout=stereo:sample_rate=44100 \
-  -c:v libx264 -preset veryfast -b:v 2500k -maxrate 2500k -bufsize 512k \
-  -g "$((FPS*2))" \
+  -c:v libx264 -preset veryfast \
+      -b:v "${BITRATE}" -maxrate "${BITRATE}" -bufsize "${BUF_SIZE}" \
+      -g $((FPS * 2)) -pix_fmt yuv420p \
   -c:a aac -b:a 128k -ar 44100 \
-  -shortest \
   -f flv "${STREAM_URL}/${STREAM_KEY}"

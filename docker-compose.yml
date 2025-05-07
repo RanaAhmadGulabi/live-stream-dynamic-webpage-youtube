@@ -6,4 +6,6 @@ services:
     env_file:
       - .env
     volumes:
+      - ./html:/app/html:ro
       - ./screenshots:/app/screenshots
+      - ./start.sh:/app/start.sh:ro
