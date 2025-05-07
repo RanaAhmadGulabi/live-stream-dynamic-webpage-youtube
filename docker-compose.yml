@@ -1,0 +1,9 @@
+# remove or ignore the top-level version: line to silence that warning
+services:
+  stream:
+    build: .
+    restart: always
+    env_file:
+      - .env
+    volumes:
+      - ./screenshots:/app/screenshots
